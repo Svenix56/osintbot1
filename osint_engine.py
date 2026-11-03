@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from io import BytesIO
 from urllib.parse import quote_plus, unquote
 
-# Убираем предупреждение о переименовании duckduckgo_search -> ddgs
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 import aiohttp
@@ -25,12 +24,6 @@ from phonenumbers import carrier, geocoder, timezone as pn_timezone
 from config import settings, detect_local_proxy
 from database import is_target_blocked
 from validators import TargetType, normalize_car_plate
-
-try:
-    from playwright.async_api import async_playwright
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
 
 HAS_DDGS = False
 try:
@@ -56,7 +49,6 @@ TG_API_ID = 2040
 TG_API_HASH = "b18441a1ff607e10a989891a5462e627"
 TELETHON_SESSION_FILE = "osint_userbot.session"
 _telethon_lock = asyncio.Lock()
-_pw_lock = asyncio.Lock()
 
 ANSI_ESCAPE_RE = re.compile(r"(?:\x1B[@-_][0-?]*[ -/]*[@-~]|\[\d+(?:;\d+)*m)")
 CLI_JUNK_PHRASES = (
@@ -69,7 +61,7 @@ EXTRACT_PHONE_RE = re.compile(r"(?:\+7|8)[\s\-\(]*9\d{2}[\s\-\)]*\d{3}[\s\-]*\d{
 EXTRACT_EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,6}")
 EXTRACT_IP_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
 
-# Ищем только конечные ссылки на профиль человека (без вложенных /artist/123 или /wall/123!)
+# Строгие регулярки только для конечных ссылок на профили пользователей (без /artist/123 и /wall/123)
 EXTRACT_TG_LINK_RE = re.compile(r"t\.me/([a-zA-Z][a-zA-Z0-9_]{3,30})(?![a-zA-Z0-9_/])")
 EXTRACT_PLAIN_AT_NICK_RE = re.compile(r"(?<![a-zA-Z0-9_.+-])@([a-zA-Z][a-zA-Z0-9_]{3,30})\b")
 EXTRACT_VK_SLUG_RE = re.compile(r"vk\.(?:com|ru)/([a-zA-Z0-9_\.]{3,30})(?![a-zA-Z0-9_/])")
@@ -77,7 +69,6 @@ EXTRACT_OTHER_NICK_RE = re.compile(
     r"(?:instagram\.com/|tiktok\.com/@|github\.com/|pikabu\.ru/@|habr\.com/ru/users/|steamcommunity\.com/id/|drive2\.ru/users/)([a-zA-Z0-9_\.-]{3,30})(?![a-zA-Z0-9_/])"
 )
 
-# Все системные разделы ВК, группы и служебные слова, которые НЕ являются пользователями
 STOP_WORDS_SLUGS = {
     "artist", "audio", "music", "podcasts", "clips", "video", "videos", "wall", "login",
     "feed", "friends", "albums", "album", "photos", "photo", "public", "club", "event",
@@ -90,7 +81,6 @@ STOP_WORDS_SLUGS = {
     "gmail", "mail", "yandex", "icloud", "rambler", "outlook", "hotmail", "inbox", "list", "bk"
 }
 
-# Признаки того, что страница ВК — это группа/паблик/заглушка, а НЕ человек
 VK_NON_USER_TITLES = (
     "404", "вход", "быстрый вход", "ошибка", "bad browser", "добро пожаловать",
     "у вас отключен", "частное сообщество", "сообщество", "открытая группа",
@@ -129,6 +119,14 @@ async def run_cli(args: list[str], timeout: int = 55) -> str:
     return "Совпадений не обнаружено."
 
 
+def clean_vk_snippet(body: str) -> str:
+    """Очищает кэш-описание ВК от стандартной фразы 'Войдите на сайт или зарегистрируйтесь...'."""
+    if not body:
+        return "Профиль пользователя ВК"
+    cleaned = re.split(r"Войдите на сайт|Log in or sign up|Зарегистрируйтесь", body, flags=re.I)[0].strip()
+    return cleaned[:110].strip(" .,|-") or "Профиль пользователя ВК"
+
+
 class OSINTEngine:
     def __init__(self):
         self.timeout = aiohttp.ClientTimeout(total=18)
@@ -136,57 +134,6 @@ class OSINTEngine:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
         }
-        self._pw = None
-        self._browser = None
-
-    async def _get_playwright_browser(self):
-        if not HAS_PLAYWRIGHT:
-            return None
-        async with _pw_lock:
-            if self._browser is None:
-                try:
-                    self._pw = await async_playwright().start()
-                    self._browser = await self._pw.chromium.launch(
-                        headless=True,
-                        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
-                    )
-                    print("🌐 [Playwright] Фоновый браузер Chromium успешно запущен!")
-                except Exception as e:
-                    print(f"⚠️ [Playwright Launch Error]: {e}")
-                    return None
-            return self._browser
-
-    async def fetch_with_playwright(self, url: str, wait_ms: int = 2000) -> tuple[str, str]:
-        """Открывает страницу в Chromium (подхватывает vk_auth_state.json, если вы вошли через login_vk.py)."""
-        browser = await self._get_playwright_browser()
-        if not browser:
-            return "", ""
-        context = None
-        try:
-            ctx_kwargs = {
-                "user_agent": self.headers["User-Agent"],
-                "locale": "ru-RU",
-                "viewport": {"width": 1280, "height": 800}
-            }
-            if os.path.exists("vk_auth_state.json"):
-                ctx_kwargs["storage_state"] = "vk_auth_state.json"
-
-            context = await browser.new_context(**ctx_kwargs)
-            page = await context.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_timeout(wait_ms)
-            title = await page.title()
-            content = await page.content()
-            return title, content
-        except Exception as e:
-            print(f"[Playwright Page Error] {url}: {e}")
-            return "", ""
-        finally:
-            if context:
-                try:
-                    await context.close()
-                except Exception:
-                    pass
 
     @staticmethod
     def _decode_bytes(raw_b: bytes) -> str:
@@ -208,32 +155,56 @@ class OSINTEngine:
             pass
         return ""
 
-    # ==================== ПОИСКОВИК (DDGS + PLAYWRIGHT BING) ====================
+    # ==================== ПОИСКОВЫЙ КЭШ-ИНДЕКС (DDGS + DUCKDUCKGO RU + BING RU) ====================
 
     async def web_search_clean(self, query: str, session: aiohttp.ClientSession, max_results: int = 8) -> list[dict]:
         results = []
 
+        # 1. DDGS с принудительной русской локалью (ru-ru)
         if HAS_DDGS:
-            for p_val in [None]:
-                try:
-                    def _do_ddg(p):
-                        with DDGS(proxy=p, timeout=10) as ddgs:
-                            return list(ddgs.text(query, region="ru-ru", max_results=max_results))
+            try:
+                def _do_ddg():
+                    with DDGS(timeout=10) as ddgs:
+                        return list(ddgs.text(query, region="ru-ru", max_results=max_results))
+                raw_res = await asyncio.to_thread(_do_ddg)
+                for r in raw_res:
+                    results.append({
+                        "title": r.get("title", ""),
+                        "href": unquote(r.get("href", "") or r.get("link", "")),
+                        "body": r.get("body", "") or r.get("snippet", "")
+                    })
+                if results:
+                    return results
+            except Exception:
+                pass
 
-                    raw_res = await asyncio.to_thread(_do_ddg, p_val)
-                    for r in raw_res:
+        # 2. DuckDuckGo HTML с параметром kl=ru-ru (отдаёт русские заголовки ВК даже из Амстердама!)
+        try:
+            ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}&kl=ru-ru"
+            html_d = await self.fetch_url_text(ddg_url, session)
+            if html_d:
+                soup = BeautifulSoup(html_d, "html.parser")
+                for block in soup.select(".result__body")[:max_results]:
+                    a = block.select_one("a.result__a")
+                    sn = block.select_one(".result__snippet")
+                    if a:
+                        raw_href = unquote(a.get("href", ""))
+                        if "uddg=" in raw_href:
+                            raw_href = unquote(raw_href.split("uddg=")[-1].split("&")[0])
                         results.append({
-                            "title": r.get("title", ""),
-                            "href": unquote(r.get("href", "") or r.get("link", "")),
-                            "body": r.get("body", "") or r.get("snippet", "")
+                            "title": a.get_text(" ", strip=True),
+                            "href": raw_href,
+                            "body": sn.get_text(" ", strip=True) if sn else ""
                         })
-                    if results:
-                        return results
-                except Exception:
-                    pass
+                if results:
+                    return results
+        except Exception:
+            pass
 
-        if HAS_PLAYWRIGHT:
-            _, html_b = await self.fetch_with_playwright(f"https://www.bing.com/search?q={quote_plus(query)}", wait_ms=1500)
+        # 3. Bing Search с параметром setlang=ru-RU&cc=RU
+        try:
+            bing_url = f"https://www.bing.com/search?q={quote_plus(query)}&setlang=ru-RU&cc=RU"
+            html_b = await self.fetch_url_text(bing_url, session)
             if html_b:
                 soup = BeautifulSoup(html_b, "html.parser")
                 for li in soup.select("li.b_algo")[:max_results]:
@@ -245,164 +216,117 @@ class OSINTEngine:
                             "href": unquote(a.get("href", "")),
                             "body": p.get_text(" ", strip=True) if p else ""
                         })
-                if results:
-                    return results
+        except Exception:
+            pass
+
         return results
 
-    # ==================== ПОИСК ПОЛЬЗОВАТЕЛЕЙ ВКОНТАКТЕ (БЕЗ ГРУПП И СИСТЕМНЫХ СТРАНИЦ!) ====================
+    # ==================== ПОИСК ВКОНТАКТЕ ЧЕРЕЗ ПОИСКОВЫЙ КЭШ (БЕЗ АККАУНТОВ И БАНОВ!) ====================
 
     async def vk_lookup(self, query: str, session: aiohttp.ClientSession, by_name: bool = False) -> dict | list:
         clean_q = query.strip().lstrip("@")
         if not by_name and clean_q.lower() in STOP_WORDS_SLUGS:
             return {"found": False}
 
-        print(f"🔎 [VK] Поиск пользователя ВК: {clean_q} (by_name={by_name})")
-
-        # 1. Если есть токен в .env (полученный через login_vk.py) — используем быстрый официальный API
-        if settings.VK_SERVICE_TOKEN and len(settings.VK_SERVICE_TOKEN) > 20 and "ВСТАВЬТЕ" not in settings.VK_SERVICE_TOKEN:
-            try:
-                if by_name:
-                    params = {"q": clean_q, "count": 5, "fields": "bdate,city,domain,contacts,site", "access_token": settings.VK_SERVICE_TOKEN.strip(), "v": "5.199", "lang": "ru"}
-                    async with session.get("https://api.vk.com/method/users.search", params=params, ssl=False) as r:
-                        items = (await r.json()).get("response", {}).get("items", [])
-                        if items:
-                            return [{"id": u.get("id"), "full_name": f"{u.get('first_name', '')} {u.get('last_name', '')}".strip(), "city": u.get("city", {}).get("title", "Не указан"), "bdate": u.get("bdate", "Скрыта"), "url": f"https://vk.com/{u.get('domain') or 'id' + str(u.get('id'))}"} for u in items]
-                else:
-                    params = {"user_ids": clean_q, "fields": "first_name,last_name,bdate,city,domain,status,contacts,site", "access_token": settings.VK_SERVICE_TOKEN.strip(), "v": "5.199", "lang": "ru"}
-                    async with session.get("https://api.vk.com/method/users.get", params=params, ssl=False) as r:
-                        users = (await r.json()).get("response", [])
-                        if users:
-                            u = users[0]
-                            return {"found": True, "vk_id": u.get("id"), "full_name": f"{u.get('first_name', '')} {u.get('last_name', '')}".strip(), "url": f"https://vk.com/{u.get('domain') or 'id' + str(u.get('id'))}", "bdate": u.get("bdate", "Скрыта"), "city": u.get("city", {}).get("title", "Не указан"), "status": u.get("status", ""), "mobile_phone": u.get("mobile_phone", ""), "site": u.get("site", "")}
-            except Exception:
-                pass
-
-        # 2. Открытие профиля через Playwright (проверяем, что это ЧЕЛОВЕК, а не группа/сообщество!)
-        async def resolve_user_via_playwright(slug: str) -> dict:
-            s_clean = slug.strip().lstrip("@")
-            if s_clean.lower() in STOP_WORDS_SLUGS or s_clean.lower().startswith(("club", "public", "event", "wall", "album", "artist", "app")):
-                return {"found": False}
-            target_slug = f"id{s_clean}" if s_clean.isdigit() else s_clean
-            vk_url = f"https://vk.com/{target_slug}"
-
-            if HAS_PLAYWRIGHT:
-                for test_url in (f"https://m.vk.com/{target_slug}", vk_url):
-                    title, html_text = await self.fetch_with_playwright(test_url, wait_ms=2200)
-                    if not html_text:
-                        continue
-
-                    # Если в коде страницы отрицательный owner_id или ссылка vk://vk.com/club... — это ГРУППА, пропускаем!
-                    if re.search(r"vk://vk\.com/(?:club|public|event)\d+", html_text) or re.search(r'"group_id":\s*\d+', html_text):
-                        print(f"ℹ️ [VK Skip] {vk_url} — это группа/сообщество, а не пользователь.")
-                        return {"found": False}
-
-                    soup = BeautifulSoup(html_text, "html.parser")
-                    og_type = soup.find("meta", property="og:type")
-                    if og_type and og_type.has_attr("content") and og_type["content"] not in ("profile", "website"):
-                        continue
-
-                    name_el = (
-                        soup.select_one("#owner_page_name")
-                        or soup.select_one(".OwnerPageName")
-                        or soup.select_one("h2.op_header")
-                        or soup.select_one(".pp_cont h2")
-                        or soup.find("meta", property="og:title")
-                    )
-                    raw_name = ""
-                    if name_el:
-                        raw_name = name_el["content"] if name_el.has_attr("content") else name_el.get_text(" ", strip=True)
-                    if not raw_name and title:
-                        raw_name = title.split("|")[0].replace("ВКонтакте", "").strip()
-
-                    if raw_name:
-                        clean_name = raw_name.split("|")[0].replace("ВКонтакте", "").strip()
-                        c_low = clean_name.lower()
-                        # Отсеиваем все группы, паблики и системные заглушки
-                        if any(bad in c_low for bad in VK_NON_USER_TITLES) or c_low in ("вконтакте", "vk", ""):
-                            continue
-
-                        info_text = ""
-                        for sel in (".OwnerInfo__row", ".pp_info", ".profile_info", "meta[property='og:description']"):
-                            els = soup.select(sel)
-                            if els:
-                                info_text = " | ".join(
-                                    (el["content"] if el.has_attr("content") else el.get_text(" ", strip=True))
-                                    for el in els[:3]
-                                )
-                                if info_text:
-                                    break
-
-                        id_m = re.search(r"vk\.com/id(\d+)", html_text) or re.search(r'"owner_id":\s*(\d+)', html_text) or re.search(r"wall(\d+)_", html_text)
-                        print(f"✅ [Playwright VK User OK] Найден пользователь: {clean_name} ({vk_url})")
-                        return {
-                            "found": True,
-                            "vk_id": id_m.group(1) if id_m else target_slug,
-                            "full_name": clean_name,
-                            "url": vk_url,
-                            "city": info_text[:90] if info_text else "Профиль пользователя ВК",
-                            "bdate": "См. в профиле"
-                        }
-
-            # 3. Поиск через кэш поисковика
-            for sq in [f"site:vk.com/{target_slug}", f'"{target_slug}" site:vk.com']:
-                for item in await self.web_search_clean(sq, session, max_results=5):
-                    if f"/{target_slug.lower()}" in item["href"].lower():
-                        clean_name = item["title"].split("|")[0].replace("ВКонтакте", "").strip()
-                        if clean_name and not any(bad in clean_name.lower() for bad in VK_NON_USER_TITLES):
-                            return {
-                                "found": True,
-                                "vk_id": target_slug,
-                                "full_name": clean_name,
-                                "url": vk_url,
-                                "city": item["body"][:80] if item.get("body") else "Найдено в индексе ВК",
-                                "bdate": "См. страницу"
-                            }
-            return {"found": False}
-
-        # Поиск по Имени и Фамилии
+        # --- 1. ПОИСК ПО ИМЕНИ И ФАМИЛИИ ЧЕРЕЗ КЭШ ПОИСКОВИКОВ ---
         if by_name:
             results = []
             seen_urls = set()
-
-            if HAS_PLAYWRIGHT:
-                people_url = (
-                    f"https://vk.com/search?c[q]={quote_plus(clean_q)}&c[section]=people"
-                    if os.path.exists("vk_auth_state.json")
-                    else f"https://vk.com/people/{quote_plus('_'.join(clean_q.split()))}"
-                )
-                _, html_people = await self.fetch_with_playwright(people_url, wait_ms=2200)
-                if html_people:
-                    soup = BeautifulSoup(html_people, "html.parser")
-                    for a in soup.select("div.people_row div.labeled.name a, .search_item a, div.people_row a")[:15]:
-                        href = a.get("href", "")
-                        txt = a.get_text(" ", strip=True)
-                        if href.startswith("/") and len(href) > 2:
-                            slug_p = href.lstrip("/").split("/")[0].split("?")[0]
-                            if slug_p.lower() not in STOP_WORDS_SLUGS and not slug_p.lower().startswith(("club", "public", "event")):
-                                full_u = f"https://vk.com/{slug_p}"
-                                if full_u not in seen_urls and len(txt) > 3 and not any(b in txt.lower() for b in VK_NON_USER_TITLES):
-                                    seen_urls.add(full_u)
-                                    results.append({"id": slug_p, "full_name": txt[:60], "city": "Поиск людей ВК", "bdate": "", "url": full_u})
-                                    if len(results) >= 5:
-                                        return results
-
-            for item in await self.web_search_clean(f'site:vk.com "{clean_q}"', session, max_results=10):
-                m = EXTRACT_VK_SLUG_RE.search(item["href"])
-                if m:
-                    slug = m.group(1)
-                    if slug.lower() in STOP_WORDS_SLUGS or slug.lower().startswith(("wall", "club", "public", "event", "albums", "people", "artist")):
+            search_queries = [
+                f'site:vk.com "{clean_q}"',
+                f'"{clean_q}" ВКонтакте site:vk.com'
+            ]
+            for sq in search_queries:
+                for item in await self.web_search_clean(sq, session, max_results=10):
+                    href = item["href"]
+                    m = EXTRACT_VK_SLUG_RE.search(href)
+                    if not m:
                         continue
+                    slug = m.group(1)
+                    s_low = slug.lower()
+                    if s_low in STOP_WORDS_SLUGS or s_low.startswith(("wall", "club", "public", "event", "albums", "people", "artist", "audio", "video", "clip", "app", "topic", "page")):
+                        continue
+
                     full_u = f"https://vk.com/{slug}"
                     if full_u not in seen_urls:
+                        clean_t = re.split(r"\||—|-", item["title"])[0].replace("ВКонтакте", "").replace("VK", "").strip()
+                        if not clean_t or any(bad in clean_t.lower() for bad in VK_NON_USER_TITLES):
+                            continue
                         seen_urls.add(full_u)
-                        clean_t = item["title"].split("|")[0].replace("ВКонтакте", "").strip()
-                        if clean_t and not any(b in clean_t.lower() for b in VK_NON_USER_TITLES):
-                            results.append({"id": slug, "full_name": clean_t, "city": item["body"][:70] if item.get("body") else "Профиль ВК", "bdate": "по ссылке", "url": full_u})
+                        info_snippet = clean_vk_snippet(item.get("body", ""))
+                        results.append({
+                            "id": slug,
+                            "full_name": clean_t,
+                            "city": info_snippet,
+                            "bdate": "",
+                            "url": full_u
+                        })
                         if len(results) >= 5:
                             return results
             return results
 
-        return await resolve_user_via_playwright(clean_q)
+        # --- 2. ПОИСК ПО НИКНЕЙМУ ИЛИ ЧИСЛОВОМУ ID ЧЕРЕЗ КЭШ ПОИСКОВИКОВ ---
+        target_slug = f"id{clean_q}" if clean_q.isdigit() else clean_q
+        if target_slug.lower() in STOP_WORDS_SLUGS or target_slug.lower().startswith(("club", "public", "event", "wall", "album", "artist", "app")):
+            return {"found": False}
+
+        vk_url = f"https://vk.com/{target_slug}"
+
+        # Опрашиваем поисковый индекс по точному адресу страницы ВК
+        search_queries = [
+            f'site:vk.com/{target_slug}',
+            f'"vk.com/{target_slug}"',
+            f'"{clean_q}" site:vk.com'
+        ]
+        for sq in search_queries:
+            items = await self.web_search_clean(sq, session, max_results=6)
+            for item in items:
+                href_low = item["href"].lower()
+                # Проверяем, что ссылка ведёт именно на профиль человека (а не на пост/стену/музыку)
+                m = EXTRACT_VK_SLUG_RE.search(item["href"])
+                if not m:
+                    continue
+                found_slug = m.group(1)
+                if found_slug.lower() != target_slug.lower() and clean_q.lower() not in found_slug.lower():
+                    continue
+                if found_slug.lower() in STOP_WORDS_SLUGS or found_slug.lower().startswith(("wall", "club", "public", "event", "artist")):
+                    continue
+
+                raw_title = item.get("title", "")
+                clean_name = re.split(r"\||—", raw_title)[0].replace("ВКонтакте", "").replace("VK", "").strip()
+                if not clean_name or any(bad in clean_name.lower() for bad in VK_NON_USER_TITLES):
+                    continue
+
+                snippet_info = clean_vk_snippet(item.get("body", ""))
+                return {
+                    "found": True,
+                    "vk_id": found_slug,
+                    "full_name": clean_name,
+                    "url": f"https://vk.com/{found_slug}",
+                    "city": snippet_info,
+                    "bdate": "См. кэш профиля"
+                }
+
+        # Резервная быстрая проверка заголовка для открытых международных страниц
+        html_text = await self.fetch_url_text(vk_url, session, custom_ua="TelegramBot (like TwitterBot)")
+        if html_text and "Быстрый вход" not in html_text:
+            soup = BeautifulSoup(html_text, "html.parser")
+            og_title = soup.find("meta", property="og:title")
+            og_desc = soup.find("meta", property="og:description")
+            if og_title and og_title.has_attr("content"):
+                c_name = og_title["content"].split("|")[0].replace("ВКонтакте", "").strip()
+                if c_name and not any(bad in c_name.lower() for bad in VK_NON_USER_TITLES):
+                    desc_s = og_desc["content"] if (og_desc and og_desc.has_attr("content")) else ""
+                    return {
+                        "found": True,
+                        "vk_id": target_slug,
+                        "full_name": c_name,
+                        "url": vk_url,
+                        "city": clean_vk_snippet(desc_s),
+                        "bdate": ""
+                    }
+
+        return {"found": False}
 
     # ==================== TELETHON + WHATSAPP ====================
 
@@ -670,27 +594,17 @@ class OSINTEngine:
         }
         vin_re = re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")
 
-        title_n, html_txt = await self.fetch_with_playwright(nomerogram_url, wait_ms=2000) if HAS_PLAYWRIGHT else ("", await self.fetch_url_text(nomerogram_url, session))
-        if html_txt:
-            soup = BeautifulSoup(html_txt, "html.parser")
-            h1_el = soup.find("h1")
-            raw_t = (h1_el.get_text(" ", strip=True) if h1_el else "") or title_n
-            if raw_t and "404" not in raw_t and "Just a moment" not in raw_t:
-                clean_model = raw_t.replace("Номерограм", "").replace("|", "").strip()
-                if clean_model:
-                    info["car_model"] = clean_model[:120]
-            for img in soup.find_all("img"):
-                src = img.get("src", "")
-                if "nomerogram" in src and src not in info["photos"]:
-                    info["photos"].append(src)
-
-        for q in [f'"{cyr_upper}" OR "{lat_lower.upper()}"', f'"{cyr_upper}" (drive2 OR nomerogram OR VIN)']:
+        for q in [f'site:nomerogram.ru "{cyr_upper}" OR "{lat_lower.upper()}"', f'"{cyr_upper}" OR "{lat_lower.upper()}" (drive2 OR nomerogram OR VIN)']:
             for item in await self.web_search_clean(q, session, max_results=8):
                 combined = f"{item['title']} {item['href']} {item['body']}"
                 if item not in info["web_mentions"] and len(info["web_mentions"]) < 8:
                     info["web_mentions"].append({"title": item["title"][:90], "url": item["href"][:120], "snippet": item["body"][:140]})
                 if "nomerogram.ru" in item["href"] and info["car_model"].startswith("Не определена"):
                     info["car_model"] = item["title"].split("|")[0].replace("Номерограм", "").strip()[:100]
+                if any(d in item["href"] for d in ("drive2.ru/r/", "drive2.ru/users/", "vk.com/", "platesmania.com")):
+                    link_str = f"{item['title'][:50]} ({item['href'][:90]})"
+                    if link_str not in info["owner_links"]:
+                        info["owner_links"].append(link_str)
                 for v in vin_re.findall(combined):
                     if not v.isdigit() and any(ch.isdigit() for ch in v) and v not in info["vins_found"]:
                         info["vins_found"].append(v)
@@ -718,8 +632,6 @@ class OSINTEngine:
     async def extract_contacts_and_ip_by_nick(self, username: str, vk_prof: dict, tg_prof: dict, breaches: dict, ext_soc: dict, session: aiohttp.ClientSession) -> dict:
         found_phones, found_ips = set(), set()
         found_emails = set(ext_soc.get("_summary", {}).get("emails", []))
-        if isinstance(vk_prof, dict) and vk_prof.get("mobile_phone"):
-            found_phones.add(vk_prof["mobile_phone"])
         for s in breaches.get("stealers_raw", []):
             if s.get("ip") and s.get("ip").lower() != "not found":
                 found_ips.add(f"{s['ip']} (ПК: {s.get('computer_name') or 'н/д'})")
@@ -727,6 +639,12 @@ class OSINTEngine:
             for em in EXTRACT_EMAIL_RE.findall(c):
                 if "noreply" not in em:
                     found_emails.add(em)
+        for it in await self.web_search_clean(f'"{username}" ("+79" OR "@gmail.com" OR "@mail.ru" OR "тел")', session, max_results=6):
+            txt_b = f"{it['title']} {it['body']}"
+            for ph in EXTRACT_PHONE_RE.findall(txt_b):
+                found_phones.add(ph.strip())
+            for em in EXTRACT_EMAIL_RE.findall(txt_b):
+                found_emails.add(em.strip())
         return {"phones": sorted(list(found_phones))[:5], "emails": sorted(list(found_emails))[:5], "ips": sorted(list(found_ips))[:5]}
 
     async def deep_breach_intelligence(self, target: str, target_type: TargetType, session: aiohttp.ClientSession) -> dict:
@@ -934,7 +852,7 @@ class OSINTEngine:
                 else:
                     alias_parts.append("Вероятные ники: " + ", ".join(aliases.get("generated_aliases", [])[:4]))
                 p10_aliases = " | ".join(alias_parts)
-                raw_sections.extend([("ТЕЛЕФОНЫ / IP / EMAIL", extracted_contacts), ("СОЦСЕТИ", ext_soc), ("TELEGRAM", tg_prof), ("ВК", vk_prof), ("УТЕЧКИ", breaches), ("MAIGRET", maigret_out)])
+                raw_sections.extend([("ТЕЛЕФОНЫ / IP / EMAIL", extracted_contacts), ("СОЦСЕТИ", ext_soc), ("TELEGRAM", tg_prof), ("ВК (КЭШ)", vk_prof), ("УТЕЧКИ", breaches), ("MAIGRET", maigret_out)])
 
             elif target_type == TargetType.EMAIL:
                 grav, extra_em, breaches, holehe_out = await asyncio.gather(
@@ -969,7 +887,7 @@ class OSINTEngine:
                     if tg_p.get("exists"):
                         p3_tg = f"По нику @{pivot_nick}: {tg_p.get('url')} ({tg_p.get('display_name')})"
                     if isinstance(vk_p, dict) and vk_p.get("found"):
-                        p4_vk = f"По нику @{pivot_nick}: {vk_p.get('url')} ({vk_p.get('full_name')})"
+                        p4_vk = f"По нику @{pivot_nick}: {vk_p.get('url')} — {vk_p.get('full_name')} ({vk_p.get('city')})"
                         if p2_name == "Не обнаружено":
                             p2_name = f"{vk_p.get('full_name')} (ВК)"
                     p5_tt_yt = f"TikTok: {tt_yt_p['tiktok']} | YouTube: {tt_yt_p['youtube']}"
@@ -999,10 +917,8 @@ class OSINTEngine:
 
                 if disc_nicks:
                     p10_aliases = f"Вытащенные ники (из TG / WA / Сети): {', '.join('@' + n for n in disc_nicks[:6])}"
-                elif not tg_dir.get("auth"):
-                    p10_aliases = "В вебе не засвечен (💡 Авторизуйте Telethon в /admin -> 📱 Пробив ТГ по номеру, чтобы доставать @ник из самого Telegram!)"
                 else:
-                    p10_aliases = "Никнейм скрыт настройками приватности Telegram ('Кто может найти меня по номеру')"
+                    p10_aliases = "Прямых ников в открытом индексе не засвечено"
 
                 p7_leaks = p_extra.get("leakcheck_phone", "Не найдено")
                 used_ig = [l.strip().replace("[+]", "").strip() for l in ig_out.splitlines() if "[+]" in l]
@@ -1019,7 +935,7 @@ class OSINTEngine:
                     )
                     if isinstance(vk_piv, dict) and vk_piv.get("found"):
                         disc_names.append(f"{vk_piv.get('full_name')} (ВК)")
-                        p4_vk = f"По нику @{primary_vk_slug}: {vk_piv.get('url')} ({vk_piv.get('full_name')})"
+                        p4_vk = f"По нику @{primary_vk_slug}: {vk_piv.get('url')} — {vk_piv.get('full_name')} ({vk_piv.get('city')})"
                     if tg_piv.get("exists") and not tg_dir.get("found"):
                         disc_names.append(f"{tg_piv.get('display_name')} (TG @{primary_nick})")
                         p3_tg = f"TG (@{primary_nick} — {tg_piv.get('display_name')}): {tg_piv.get('url')} | {wa_part}"
@@ -1042,23 +958,23 @@ class OSINTEngine:
                 p3_tg = f"ID: {target} | Оценка даты регистрации в TG: {reg['estimated_registration']}"
                 if isinstance(vk_id_info, dict) and vk_id_info.get("found"):
                     p2_name = f"{vk_id_info.get('full_name')} (ВК id{target})"
-                    p4_vk = f"{vk_id_info.get('url')} ({vk_id_info.get('full_name')})"
+                    p4_vk = f"{vk_id_info.get('url')} — {vk_id_info.get('full_name')} ({vk_id_info.get('city')})"
                 raw_sections.extend([("TG ID", reg), ("ВК ПО ID", vk_id_info)])
 
             elif target_type == TargetType.FULLNAME:
                 p2_name = target
                 vk_list = await self.vk_lookup(target, session, by_name=True)
                 if isinstance(vk_list, list) and vk_list:
-                    p4_vk = " ; ".join([f"{u['full_name']} ({u.get('city') or 'н/д'}) — {u['url']}" for u in vk_list[:4]])
+                    p4_vk = " ; ".join([f"{u['full_name']} ({u.get('city') or 'ВК'}) — {u['url']}" for u in vk_list[:4]])
                 else:
                     p4_vk = "Анкет в открытом доступе не найдено"
-                raw_sections.append(("ПОИСК ПО ФИО В ВК", vk_list))
+                raw_sections.append(("ПОИСК ПО ФИО В ВК (КЭШ)", vk_list))
 
             elif target_type == TargetType.CAR_PLATE:
                 car_info = await self.car_plate_osint(target, session)
                 p2_name = f"Автомобиль: {car_info['car_model']}"
                 p4_vk = " ; ".join(car_info["owner_links"][:3]) if car_info["owner_links"] else "Профили Drive2 / ВК не засвечены"
-                p6_platforms = f"Номерограм: {car_info['nomerogram_url']} | Фото: {len(car_info['photos'])} шт."
+                p6_platforms = f"Номерограм: {car_info['nomerogram_url']}"
                 vin_str = f" | 🔢 VIN: {', '.join(car_info['vins_found'][:2])}" if car_info["vins_found"] else ""
                 ph_str = f" | 📞 Тел: {', '.join(car_info['phones_found'][:3])}" if car_info["phones_found"] else ""
                 p9_geo_net = f"Регион учёта: {car_info['region']}{vin_str}{ph_str}"
