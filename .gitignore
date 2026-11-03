@@ -1,0 +1,9 @@
+.env
+*.session
+*.session-journal
+vk_auth_state.json
+*.db
+venv/
+.idea/
+__pycache__/
+local_dumps/

@@ -1,0 +1,12 @@
+aiogram>=3.13.0
+aiohttp>=3.10.0
+aiosqlite>=0.20.0
+pydantic-settings>=2.4.0
+exifread>=3.0.0
+phonenumbers>=8.13.45
+beautifulsoup4>=4.12.3
+dnspython>=2.6.1
+socid-extractor>=0.0.27
+maigret>=0.4.4
+holehe>=1.61
+ignorant>=1.2
